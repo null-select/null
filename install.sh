@@ -49,8 +49,6 @@ fi
 tar -xzf "${temporary_directory}/${asset}" -C "$temporary_directory" null
 if [ -n "${NULL_INSTALL_DIR:-}" ]; then
   install_directory="$NULL_INSTALL_DIR"
-elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
-  install_directory="/usr/local/bin"
 else
   install_directory="${HOME}/.local/bin"
 fi

@@ -8,14 +8,14 @@
 curl -fsSL https://raw.githubusercontent.com/null-select/null/main/install.sh | sh
 ```
 
-The installer supports macOS and Linux on amd64 and arm64, verifies the release SHA-256 checksum, and installs to `/usr/local/bin` when writable or `$HOME/.local/bin` otherwise. Set `NULL_INSTALL_DIR` to select another directory or `NULL_VERSION=v0.1.0` to pin a release.
+The installer supports macOS and Linux on amd64 and arm64, verifies the release SHA-256 checksum, and installs to `$HOME/.local/bin` without elevated privileges. Set `NULL_INSTALL_DIR` to select another directory or `NULL_VERSION=v0.1.1` to pin a release.
 
 ## Connect
 
 Create an enrollment for an execution in [console.null.select](https://console.null.select), then run the command shown there:
 
 ```sh
-null connect \
+$HOME/.local/bin/null connect \
   --server https://console.null.select/connect \
   --provider declared \
   --model your-model \
