@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -race ./...
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          mkdir dist
+          for os_name in darwin linux; do
+            for arch_name in amd64 arm64; do
+              asset="null_${os_name}_${arch_name}"
+              CGO_ENABLED=0 GOOS="$os_name" GOARCH="$arch_name" go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "dist/null" .
+              tar -C dist -czf "dist/${asset}.tar.gz" null
+              rm dist/null
+            done
+          done
+          cd dist
+          sha256sum null_*.tar.gz > checksums.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
