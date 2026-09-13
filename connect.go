@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -43,6 +44,7 @@ type clientConfig struct {
 	Harness               string    `json:"harness"`
 	CapabilityDigest      string    `json:"capability_digest"`
 	BindingIdempotencyKey string    `json:"binding_idempotency_key"`
+	FencingEpoch          int64     `json:"fencing_epoch,omitempty"`
 }
 
 type exchangeResponse struct {
@@ -63,15 +65,45 @@ type bindResponse struct {
 		Harness  string `json:"Harness"`
 	} `json:"incarnation"`
 	Lease struct {
-		ID           string    `json:"ID"`
-		ExpiresAt    time.Time `json:"ExpiresAt"`
-		FencingEpoch int64     `json:"FencingEpoch"`
+		ID            string    `json:"ID"`
+		ExecutionID   string    `json:"ExecutionID"`
+		IncarnationID string    `json:"IncarnationID"`
+		ExpiresAt     time.Time `json:"ExpiresAt"`
+		FencingEpoch  int64     `json:"FencingEpoch"`
 	} `json:"lease"`
 	Epoch  int64 `json:"fencing_epoch"`
 	Cursor int64 `json:"cursor"`
 }
 
+type heartbeatResponse struct {
+	Status string `json:"status"`
+	Lease  struct {
+		ID            string    `json:"ID"`
+		ExecutionID   string    `json:"ExecutionID"`
+		IncarnationID string    `json:"IncarnationID"`
+		ExpiresAt     time.Time `json:"ExpiresAt"`
+		FencingEpoch  int64     `json:"FencingEpoch"`
+	} `json:"lease"`
+}
+
+type gatewayError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *gatewayError) Error() string {
+	if e.Code != "" {
+		return e.Code + ": " + e.Message
+	}
+	return e.Message
+}
+
 func runConnect(args []string, input io.Reader, output io.Writer) error {
+	return runConnectContext(context.Background(), args, input, output)
+}
+
+func runConnectContext(ctx context.Context, args []string, input io.Reader, output io.Writer) error {
 	flags := flag.NewFlagSet("connect", flag.ContinueOnError)
 	flags.SetOutput(output)
 	server := flags.String("server", defaultGateway, "null.select connection gateway")
@@ -82,7 +114,8 @@ func runConnect(args []string, input io.Reader, output io.Writer) error {
 	clientName := flags.String("client-name", "local agent runtime", "operator-visible client name")
 	configPath := flags.String("config", defaultClientConfigPath(), "credential configuration path")
 	reEnroll := flags.Bool("re-enroll", false, "replace the saved enrollment for this config path")
-	jsonOutput := flags.Bool("json", false, "print the binding response as JSON")
+	jsonOutput := flags.Bool("json", false, "print the binding response as JSON and exit")
+	once := flags.Bool("once", false, "bind once without maintaining the lease")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -103,13 +136,13 @@ func runConnect(args []string, input io.Reader, output io.Writer) error {
 				return err
 			}
 		}
-		config, err = exchangeAndSave(*server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
+		config, err = exchangeAndSave(ctx, *server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
 	} else {
 		config, err = loadClientConfig(*configPath)
 		if os.IsNotExist(err) {
 			token, err = promptEnrollmentToken(input, output)
 			if err == nil {
-				config, err = exchangeAndSave(*server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
+				config, err = exchangeAndSave(ctx, *server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
 			}
 		} else if err == nil && (config.Server != strings.TrimRight(*server, "/") || config.Provider != *provider || config.Model != *model || config.Harness != *harness || config.CapabilityDigest != *capability) {
 			return errors.New("saved enrollment is bound to different runtime options; use the original options or --re-enroll")
@@ -118,9 +151,13 @@ func runConnect(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("prepare workload credential: %w", err)
 	}
-	response, raw, err := bindEnrolledRuntime(config)
+	response, raw, err := bindEnrolledRuntime(ctx, config)
 	if err != nil {
 		return fmt.Errorf("bind runtime (credential remains saved for retry): %w", err)
+	}
+	config.FencingEpoch = response.Epoch
+	if err := saveClientConfig(*configPath, config); err != nil {
+		return fmt.Errorf("save bound fencing epoch: %w", err)
 	}
 	if *jsonOutput {
 		_, err = output.Write(append(raw, '\n'))
@@ -129,7 +166,10 @@ func runConnect(args []string, input io.Reader, output io.Writer) error {
 	_, err = fmt.Fprintf(output, "Connected to null.select\nExecution: %s\nRuntime: %s\nModel: %s/%s\nFencing epoch: %d\nLease expires: %s\nCredential: %s\n",
 		config.ExecutionID, response.Incarnation.ID, config.Provider, config.Model, response.Epoch,
 		response.Lease.ExpiresAt.Format(time.RFC3339), *configPath)
-	return err
+	if err != nil || *once {
+		return err
+	}
+	return maintainLease(ctx, config, response, output)
 }
 
 func promptEnrollmentToken(input io.Reader, output io.Writer) (string, error) {
@@ -173,10 +213,10 @@ func validateConnectOptions(server, provider, model, harness, capability, client
 	return nil
 }
 
-func exchangeAndSave(server, enrollmentToken, clientName, provider, model, harness, capability, configPath string) (clientConfig, error) {
+func exchangeAndSave(ctx context.Context, server, enrollmentToken, clientName, provider, model, harness, capability, configPath string) (clientConfig, error) {
 	requestBody, _ := json.Marshal(map[string]string{"enrollment_token": enrollmentToken, "client_name": clientName})
 	var exchange exchangeResponse
-	if _, err := connectRequest(http.MethodPost, strings.TrimRight(server, "/")+"/v1/enrollments/exchange", "", requestBody, &exchange); err != nil {
+	if _, err := connectRequest(ctx, http.MethodPost, strings.TrimRight(server, "/")+"/v1/enrollments/exchange", "", requestBody, &exchange); err != nil {
 		return clientConfig{}, fmt.Errorf("exchange enrollment: %w", err)
 	}
 	if exchange.Token == "" || exchange.Credential.ID == "" || exchange.Credential.ExecutionID == "" || exchange.Credential.SubjectID == "" || exchange.Credential.ExpiresAt.IsZero() {
@@ -196,25 +236,112 @@ func exchangeAndSave(server, enrollmentToken, clientName, provider, model, harne
 	return config, nil
 }
 
-func bindEnrolledRuntime(config clientConfig) (bindResponse, []byte, error) {
+func bindEnrolledRuntime(ctx context.Context, config clientConfig) (bindResponse, []byte, error) {
 	body, _ := json.Marshal(map[string]string{
 		"incarnation_id": config.IncarnationID, "provider": config.Provider, "model": config.Model,
 		"harness": config.Harness, "process_instance": config.ProcessInstance,
 		"capability_digest": config.CapabilityDigest, "idempotency_key": config.BindingIdempotencyKey,
 	})
 	var response bindResponse
-	raw, err := connectRequest(http.MethodPost, config.Server+"/v1/executions/"+url.PathEscape(config.ExecutionID)+"/runtimes", config.CredentialToken, body, &response)
+	raw, err := connectRequest(ctx, http.MethodPost, config.Server+"/v1/executions/"+url.PathEscape(config.ExecutionID)+"/runtimes", config.CredentialToken, body, &response)
 	if err != nil {
 		return bindResponse{}, nil, err
 	}
-	if response.Incarnation.ID == "" || response.Lease.ID == "" || response.Epoch < 1 || response.Lease.ExpiresAt.IsZero() {
+	if response.Incarnation.ID != config.IncarnationID || response.Lease.ID == "" || response.Lease.ExecutionID != config.ExecutionID || response.Lease.IncarnationID != config.IncarnationID || response.Epoch < 1 || response.Lease.FencingEpoch != response.Epoch || response.Lease.ExpiresAt.IsZero() {
 		return bindResponse{}, nil, errors.New("gateway binding response is incomplete")
 	}
 	return response, raw, nil
 }
 
-func connectRequest(method, target, bearerToken string, body []byte, result any) ([]byte, error) {
-	request, err := http.NewRequest(method, target, bytes.NewReader(body))
+func maintainLease(ctx context.Context, config clientConfig, binding bindResponse, output io.Writer) error {
+	return maintainLeaseWith(ctx, config, binding, output, time.Now, waitForContext, renewLease)
+}
+
+func maintainLeaseWith(ctx context.Context, config clientConfig, binding bindResponse, output io.Writer, now func() time.Time, wait func(context.Context, time.Duration) error, renew func(context.Context, clientConfig, int64) (heartbeatResponse, error)) error {
+	leaseID, expiresAt := binding.Lease.ID, binding.Lease.ExpiresAt
+	if _, err := fmt.Fprintln(output, "Lease heartbeat active. Keep this process running; press Ctrl-C to disconnect."); err != nil {
+		return err
+	}
+	delay := renewalDelay(now(), expiresAt)
+	for {
+		if delay <= 0 || !now().Before(config.ExpiresAt) {
+			return errors.New("effect lease can no longer be renewed; create a new enrollment")
+		}
+		if err := wait(ctx, delay); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				_, writeErr := fmt.Fprintln(output, "Disconnected. Effect authority will expire unless another valid runtime is promoted.")
+				return writeErr
+			}
+			return err
+		}
+		heartbeat, err := renew(ctx, config, binding.Epoch)
+		if err != nil {
+			if isTerminalHeartbeatError(err) {
+				return fmt.Errorf("effect authority ended: %w", err)
+			}
+			remaining := expiresAt.Sub(now())
+			if remaining <= 0 {
+				return fmt.Errorf("effect lease expired while heartbeat was unavailable: %w", err)
+			}
+			delay = retryDelay(remaining)
+			continue
+		}
+		if heartbeat.Status != "renewed" || heartbeat.Lease.ID != leaseID || heartbeat.Lease.ExecutionID != config.ExecutionID || heartbeat.Lease.IncarnationID != config.IncarnationID || heartbeat.Lease.FencingEpoch != binding.Epoch || !heartbeat.Lease.ExpiresAt.After(now()) {
+			return errors.New("heartbeat response did not match the bound runtime lease")
+		}
+		expiresAt = heartbeat.Lease.ExpiresAt
+		delay = renewalDelay(now(), expiresAt)
+	}
+}
+
+func renewLease(ctx context.Context, config clientConfig, epoch int64) (heartbeatResponse, error) {
+	body, _ := json.Marshal(map[string]any{"incarnation_id": config.IncarnationID, "fencing_epoch": epoch})
+	var response heartbeatResponse
+	_, err := connectRequest(ctx, http.MethodPost, config.Server+"/v1/executions/"+url.PathEscape(config.ExecutionID)+"/heartbeat", config.CredentialToken, body, &response)
+	return response, err
+}
+
+func renewalDelay(now, expiresAt time.Time) time.Duration {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	delay := remaining / 3
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+func retryDelay(remaining time.Duration) time.Duration {
+	delay := remaining / 4
+	if delay > 5*time.Second {
+		return 5 * time.Second
+	}
+	return delay
+}
+
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isTerminalHeartbeatError(err error) bool {
+	var failure *gatewayError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	return failure.Status >= 400 && failure.Status < 500 && failure.Status != http.StatusTooManyRequests
+}
+
+func connectRequest(ctx context.Context, method, target, bearerToken string, body []byte, result any) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -245,10 +372,7 @@ func connectRequest(method, target, bearerToken string, body []byte, result any)
 		if failure.Message == "" {
 			failure.Message = fmt.Sprintf("gateway returned HTTP %d", response.StatusCode)
 		}
-		if failure.Code != "" {
-			return nil, fmt.Errorf("%s: %s", failure.Code, failure.Message)
-		}
-		return nil, errors.New(failure.Message)
+		return nil, &gatewayError{Status: response.StatusCode, Code: failure.Code, Message: failure.Message}
 	}
 	if err := json.Unmarshal(responseBody, result); err != nil {
 		return nil, errors.New("gateway response did not match the client contract")
