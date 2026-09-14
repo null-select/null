@@ -30,6 +30,11 @@ const (
 
 var connectDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+var (
+	errSavedCredentialExpired    = errors.New("saved workload credential has expired")
+	errSavedCredentialIncomplete = errors.New("saved workload credential is incomplete")
+)
+
 type clientConfig struct {
 	Server                string    `json:"server"`
 	CredentialToken       string    `json:"credential_token"`
@@ -71,8 +76,13 @@ type bindResponse struct {
 		ExpiresAt     time.Time `json:"ExpiresAt"`
 		FencingEpoch  int64     `json:"FencingEpoch"`
 	} `json:"lease"`
-	Epoch  int64 `json:"fencing_epoch"`
-	Cursor int64 `json:"cursor"`
+	Epoch     int64  `json:"fencing_epoch"`
+	Cursor    int64  `json:"cursor"`
+	CapsuleID string `json:"capsule_id"`
+	Capsule   struct {
+		RecipientID        string `json:"recipient_incarnation_id"`
+		ExpectedNextAction string `json:"expected_next_action"`
+	} `json:"capsule"`
 }
 
 type heartbeatResponse struct {
@@ -144,6 +154,14 @@ func runConnectContext(ctx context.Context, args []string, input io.Reader, outp
 			if err == nil {
 				config, err = exchangeAndSave(ctx, *server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
 			}
+		} else if errors.Is(err, errSavedCredentialExpired) {
+			if _, writeErr := fmt.Fprintln(output, "Saved workload credential expired; enter a new console enrollment."); writeErr != nil {
+				return writeErr
+			}
+			token, err = promptEnrollmentToken(input, output)
+			if err == nil {
+				config, err = exchangeAndSave(ctx, *server, token, *clientName, *provider, *model, *harness, *capability, *configPath)
+			}
 		} else if err == nil && (config.Server != strings.TrimRight(*server, "/") || config.Provider != *provider || config.Model != *model || config.Harness != *harness || config.CapabilityDigest != *capability) {
 			return errors.New("saved enrollment is bound to different runtime options; use the original options or --re-enroll")
 		}
@@ -166,8 +184,16 @@ func runConnectContext(ctx context.Context, args []string, input io.Reader, outp
 	_, err = fmt.Fprintf(output, "Connected to null.select\nExecution: %s\nRuntime: %s\nModel: %s/%s\nFencing epoch: %d\nLease expires: %s\nCredential: %s\n",
 		config.ExecutionID, response.Incarnation.ID, config.Provider, config.Model, response.Epoch,
 		response.Lease.ExpiresAt.Format(time.RFC3339), *configPath)
-	if err != nil || *once {
+	if err != nil {
 		return err
+	}
+	if response.CapsuleID != "" {
+		if _, err := fmt.Fprintf(output, "Continuation capsule: %s\nNext action: %s\n", response.CapsuleID, response.Capsule.ExpectedNextAction); err != nil {
+			return err
+		}
+	}
+	if *once {
+		return nil
 	}
 	return maintainLease(ctx, config, response, output)
 }
@@ -249,6 +275,9 @@ func bindEnrolledRuntime(ctx context.Context, config clientConfig) (bindResponse
 	}
 	if response.Incarnation.ID != config.IncarnationID || response.Lease.ID == "" || response.Lease.ExecutionID != config.ExecutionID || response.Lease.IncarnationID != config.IncarnationID || response.Epoch < 1 || response.Lease.FencingEpoch != response.Epoch || response.Lease.ExpiresAt.IsZero() {
 		return bindResponse{}, nil, errors.New("gateway binding response is incomplete")
+	}
+	if response.CapsuleID != "" && response.Capsule.RecipientID != config.IncarnationID {
+		return bindResponse{}, nil, errors.New("gateway continuation capsule is not bound to this runtime")
 	}
 	return response, raw, nil
 }
@@ -438,8 +467,11 @@ func loadClientConfig(path string) (clientConfig, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return clientConfig{}, err
 	}
-	if config.CredentialToken == "" || config.ExecutionID == "" || config.IncarnationID == "" || config.BindingIdempotencyKey == "" || !time.Now().Before(config.ExpiresAt) {
-		return clientConfig{}, errors.New("saved workload credential is incomplete or expired")
+	if config.CredentialToken == "" || config.ExecutionID == "" || config.IncarnationID == "" || config.BindingIdempotencyKey == "" || config.ExpiresAt.IsZero() {
+		return clientConfig{}, errSavedCredentialIncomplete
+	}
+	if !time.Now().Before(config.ExpiresAt) {
+		return clientConfig{}, errSavedCredentialExpired
 	}
 	return config, nil
 }

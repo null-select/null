@@ -8,7 +8,7 @@
 curl -fsSL https://raw.githubusercontent.com/null-select/null/main/install.sh | sh
 ```
 
-The installer supports macOS and Linux on amd64 and arm64, verifies the release SHA-256 checksum, and installs to `$HOME/.local/bin` without elevated privileges. Set `NULL_INSTALL_DIR` to select another directory or `NULL_VERSION=v0.2.0` to pin a release.
+The installer supports macOS and Linux on amd64 and arm64, verifies the release SHA-256 checksum, prints the version it installed, and installs to `$HOME/.local/bin` without elevated privileges. Set `NULL_INSTALL_DIR` to select another directory or `NULL_VERSION=v0.2.1` to pin a release.
 
 ## Connect
 
@@ -26,7 +26,7 @@ The CLI prompts for the one-time enrollment token without echoing it. It never a
 
 After binding, keep `null connect` running. It renews the exact workload-owned effect lease every 30 seconds, stops immediately if the runtime is fenced or frozen, and stops safely on Ctrl-C. A transport interruption is retried only while the last confirmed lease is still valid; the CLI never assumes authority after that expiry. Use `--once` only for diagnostics that intentionally leave the lease to expire.
 
-Re-running the same command safely retries the saved binding. Use `--re-enroll` only when intentionally replacing the saved enrollment.
+Re-running the same command safely retries the saved binding. An expired, otherwise valid credential automatically returns to the enrollment prompt. Use `--re-enroll` when intentionally replacing a credential that has not expired; malformed or permission-unsafe credential files continue to fail closed.
 
 ## Inspect authority
 

@@ -55,7 +55,8 @@ fi
 mkdir -p "$install_directory"
 install -m 0755 "${temporary_directory}/null" "${install_directory}/null"
 
-echo "Installed null to ${install_directory}/null"
+installed_version=$("${install_directory}/null" version)
+echo "Installed ${installed_version} to ${install_directory}/null"
 case ":${PATH}:" in
   *":${install_directory}:"*) ;;
   *) echo "Add ${install_directory} to PATH before running null." ;;
