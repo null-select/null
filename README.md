@@ -19,14 +19,15 @@ $HOME/.local/bin/null connect \
   --server https://console.null.select/connect \
   --provider declared \
   --model your-model \
-  --capability-digest <sha256>
+  --capability-digest <sha256> \
+  --re-enroll
 ```
 
-The CLI prompts for the one-time enrollment token without echoing it. It never accepts organization or project scope from the customer. The resulting workload credential is stored in the operating system's user configuration directory with mode `0600` before the runtime bind request is sent.
+The console includes `--re-enroll` whenever it has just issued a fresh one-time secret, so customers never have to infer whether a prior local credential must be replaced. The CLI prompts for that secret without echoing it. It never accepts organization or project scope from the customer. The resulting workload credential is stored in the operating system's user configuration directory with mode `0600` before the runtime bind request is sent.
 
 After binding, keep `null connect` running. It renews the exact workload-owned effect lease every 30 seconds, stops immediately if the runtime is fenced or frozen, and stops safely on Ctrl-C. A transport interruption is retried only while the last confirmed lease is still valid; the CLI never assumes authority after that expiry. Use `--once` only for diagnostics that intentionally leave the lease to expire.
 
-Re-running the same command safely retries the saved binding. An expired, otherwise valid credential automatically returns to the enrollment prompt. Use `--re-enroll` when intentionally replacing a credential that has not expired; malformed or permission-unsafe credential files continue to fail closed.
+After a successful exchange, rerun the command without `--re-enroll` to retry the saved binding. An expired, otherwise valid credential automatically returns to the enrollment prompt. Malformed or permission-unsafe credential files continue to fail closed.
 
 ## Inspect authority
 
